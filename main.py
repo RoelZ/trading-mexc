@@ -25,23 +25,15 @@ SIDE_MAP = {
     "close_long": 4,
 }
 
-# Trigger type:
-# 1 = prijs >= stop_price (short stop-loss)
-# 2 = prijs <= stop_price (long stop-loss)
-TRIGGER_MAP = {
-    "open_long": 2,
-    "close_short": 1,
-    "open_short": 1,
-    "close_long": 2,
-}
+# order type 5 = market order
+MARKET_ORDER_TYPE = 5
 
 
 class AlertPayload(BaseModel):
     secret: str
-    symbol: str        # bijv. "BTC_USDT"
+    symbol: str        # bijv. "ETH_USDT"
     action: str        # "open_long" | "close_long" | "open_short" | "close_short"
     quantity: str      # aantal contracten
-    stop_price: str    # trigger prijs
     open_type: int = 1  # 1 = isolated, 2 = cross
     leverage: int = 10
 
@@ -57,23 +49,18 @@ async def receive_alert(payload: AlertPayload):
         raise HTTPException(status_code=400, detail="Ongeldig action. Gebruik: " + str(valid_actions))
 
     side = SIDE_MAP[action]
-    trigger_type = TRIGGER_MAP[action]
 
-    logger.info("Alert: %s %s qty=%s stop=%s side=%s trigger=%s",
-                payload.symbol, action, payload.quantity,
-                payload.stop_price, side, trigger_type)
+    logger.info("Alert: %s %s qty=%s side=%s", payload.symbol, action, payload.quantity, side)
 
     try:
-        response = client.place_plan_order(
+        response = client.order(
             symbol=payload.symbol.upper(),
+            price=0,
+            vol=float(payload.quantity),
             side=side,
-            vol=payload.quantity,
-            trigger_price=payload.stop_price,
-            trigger_type=trigger_type,
-            execute_cycle=1,
-            order_type=2,
+            type=MARKET_ORDER_TYPE,
             open_type=payload.open_type,
-            lever_rate=payload.leverage,
+            leverage=payload.leverage,
         )
         logger.info("Order geplaatst: %s", response)
         return {"status": "ok", "order": response}

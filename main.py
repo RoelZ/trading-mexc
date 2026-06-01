@@ -28,21 +28,29 @@ SIDE_MAP = {
 
 OPEN_ACTIONS = {"open_long", "open_short"}
 
-# order types
 ORDER_TYPE_LIMIT = 1
 ORDER_TYPE_MARKET = 5
 
 
 class AlertPayload(BaseModel):
     secret: str
-    symbol: str                          # bijv. "ETH_USDT"
-    action: str                          # "open_long" | "close_long" | "open_short" | "close_short"
-    quantity: str                        # aantal contracten
-    stop_loss_price: Optional[float] = None   # verplicht bij open_long / open_short
+    symbol: str
+    action: str
+    quantity: str
+    stop_loss_price: Optional[float] = None
     take_profit_price: Optional[float] = None
-    entry_price: Optional[float] = None  # ingevuld = limit order, leeg = market order
-    open_type: int = 1                   # 1 = isolated, 2 = cross
+    entry_price: Optional[float] = None
+    open_type: int = 1
     leverage: int = 10
+
+
+@app.get("/test-auth")
+def test_auth():
+    try:
+        result = client.assets()
+        return {"status": "ok", "assets": result}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 
 @app.post("/webhook")

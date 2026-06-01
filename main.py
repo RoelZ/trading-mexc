@@ -28,18 +28,20 @@ SIDE_MAP = {
 
 OPEN_ACTIONS = {"open_long", "open_short"}
 
-# order type 5 = market order
-MARKET_ORDER_TYPE = 5
+# order types
+ORDER_TYPE_LIMIT = 1
+ORDER_TYPE_MARKET = 5
 
 
 class AlertPayload(BaseModel):
     secret: str
-    symbol: str              # bijv. "ETH_USDT"
-    action: str              # "open_long" | "close_long" | "open_short" | "close_short"
-    quantity: str            # aantal contracten
+    symbol: str                          # bijv. "ETH_USDT"
+    action: str                          # "open_long" | "close_long" | "open_short" | "close_short"
+    quantity: str                        # aantal contracten
     stop_loss_price: Optional[float] = None   # verplicht bij open_long / open_short
-    take_profit_price: Optional[float] = None # optioneel
-    open_type: int = 1       # 1 = isolated, 2 = cross
+    take_profit_price: Optional[float] = None
+    entry_price: Optional[float] = None  # ingevuld = limit order, leeg = market order
+    open_type: int = 1                   # 1 = isolated, 2 = cross
     leverage: int = 10
 
 
@@ -53,28 +55,35 @@ async def receive_alert(payload: AlertPayload):
         valid_actions = list(SIDE_MAP.keys())
         raise HTTPException(status_code=400, detail="Ongeldig action. Gebruik: " + str(valid_actions))
 
-    # Stop-loss is verplicht bij het openen van een positie
     if action in OPEN_ACTIONS and payload.stop_loss_price is None:
         raise HTTPException(status_code=400, detail="stop_loss_price is verplicht bij " + action)
 
     side = SIDE_MAP[action]
 
-    logger.info("Alert: %s %s qty=%s sl=%s tp=%s",
+    if payload.entry_price is not None:
+        order_type = ORDER_TYPE_LIMIT
+        price = payload.entry_price
+    else:
+        order_type = ORDER_TYPE_MARKET
+        price = 0
+
+    logger.info("Alert: %s %s qty=%s price=%s sl=%s tp=%s type=%s",
                 payload.symbol, action, payload.quantity,
-                payload.stop_loss_price, payload.take_profit_price)
+                price, payload.stop_loss_price, payload.take_profit_price,
+                "limit" if order_type == ORDER_TYPE_LIMIT else "market")
 
     try:
         response = client.order(
             symbol=payload.symbol.upper(),
-            price=0,
+            price=price,
             vol=float(payload.quantity),
             side=side,
-            type=MARKET_ORDER_TYPE,
+            type=order_type,
             open_type=payload.open_type,
             leverage=payload.leverage,
             stop_loss_price=payload.stop_loss_price,
             take_profit_price=payload.take_profit_price,
-            loss_trend=1,    # trigger op latest price
+            loss_trend=1,
             profit_trend=1,
         )
         logger.info("Order geplaatst: %s", response)

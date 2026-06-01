@@ -4,6 +4,7 @@ import os
 from fastapi import FastAPI, HTTPException
 from pymexc import futures
 from pydantic import BaseModel
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,16 +26,20 @@ SIDE_MAP = {
     "close_long": 4,
 }
 
+OPEN_ACTIONS = {"open_long", "open_short"}
+
 # order type 5 = market order
 MARKET_ORDER_TYPE = 5
 
 
 class AlertPayload(BaseModel):
     secret: str
-    symbol: str        # bijv. "ETH_USDT"
-    action: str        # "open_long" | "close_long" | "open_short" | "close_short"
-    quantity: str      # aantal contracten
-    open_type: int = 1  # 1 = isolated, 2 = cross
+    symbol: str              # bijv. "ETH_USDT"
+    action: str              # "open_long" | "close_long" | "open_short" | "close_short"
+    quantity: str            # aantal contracten
+    stop_loss_price: Optional[float] = None   # verplicht bij open_long / open_short
+    take_profit_price: Optional[float] = None # optioneel
+    open_type: int = 1       # 1 = isolated, 2 = cross
     leverage: int = 10
 
 
@@ -48,9 +53,15 @@ async def receive_alert(payload: AlertPayload):
         valid_actions = list(SIDE_MAP.keys())
         raise HTTPException(status_code=400, detail="Ongeldig action. Gebruik: " + str(valid_actions))
 
+    # Stop-loss is verplicht bij het openen van een positie
+    if action in OPEN_ACTIONS and payload.stop_loss_price is None:
+        raise HTTPException(status_code=400, detail="stop_loss_price is verplicht bij " + action)
+
     side = SIDE_MAP[action]
 
-    logger.info("Alert: %s %s qty=%s side=%s", payload.symbol, action, payload.quantity, side)
+    logger.info("Alert: %s %s qty=%s sl=%s tp=%s",
+                payload.symbol, action, payload.quantity,
+                payload.stop_loss_price, payload.take_profit_price)
 
     try:
         response = client.order(
@@ -61,6 +72,10 @@ async def receive_alert(payload: AlertPayload):
             type=MARKET_ORDER_TYPE,
             open_type=payload.open_type,
             leverage=payload.leverage,
+            stop_loss_price=payload.stop_loss_price,
+            take_profit_price=payload.take_profit_price,
+            loss_trend=1,    # trigger op latest price
+            profit_trend=1,
         )
         logger.info("Order geplaatst: %s", response)
         return {"status": "ok", "order": response}

@@ -19,7 +19,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="TradingView MEXC Futures Webhook")
+app = FastAPI(title="TradingView MEXC Futures Webhook")  # ORB -> MEXC
 
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 MEXC_WEB_KEY = os.environ["MEXC_WEB_KEY"]  # WEB key uit browser devtools
@@ -35,6 +35,9 @@ OPEN_POSITIONS = BASE_URL + "/position/open_positions"
 ACCOUNT_ASSET = BASE_URL + "/account/asset/"  # + currency
 TPSL_PLACE = BASE_URL + "/stoporder/place"
 TPSL_CANCEL_ALL = BASE_URL + "/stoporder/cancel_all"
+
+# Publieke endpoint (geen signing) om de contractgrootte op te halen
+CONTRACT_DETAIL = "https://contract.mexc.com/api/v1/contract/detail"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -116,6 +119,28 @@ def mexc_get(url: str, params: Optional[dict] = None) -> dict:
 
 # --- SALDO & POSITIEGROOTTE ---
 
+def get_contract_size(symbol: str, fallback: float) -> float:
+    """Haal de contractgrootte (coins per contract) op via de publieke MEXC-API.
+
+    Dit voorkomt verkeerde positiegroottes door een handmatig foute waarde.
+    Lukt de opvraag niet, dan wordt de meegestuurde waarde als fallback gebruikt."""
+    try:
+        url = CONTRACT_DETAIL + "?symbol=" + symbol.upper()
+        if CURL_CFFI_AVAILABLE:
+            response = cffi_requests.get(url, impersonate="chrome110")
+        else:
+            response = cffi_requests.get(url)
+        result = response.json()
+        if result.get("success") and result.get("data"):
+            cs = result["data"].get("contractSize")
+            if cs:
+                return float(cs)
+    except Exception as e:
+        logger.warning("Kon contractSize niet ophalen voor %s (gebruik fallback %s): %s",
+                       symbol, fallback, e)
+    return fallback
+
+
 def get_account_equity(currency: str = MARGIN_CURRENCY) -> float:
     """Haal je beschikbare futures-saldo op (in USDT)."""
     result = mexc_get(ACCOUNT_ASSET + currency.upper())
@@ -182,6 +207,7 @@ def place_entry_order(payload: "AlertPayload") -> dict:
         if payload.entry_price is None or payload.stop_loss_price is None:
             raise Exception("entry_price en stop_loss_price zijn nodig voor automatische sizing.")
         balance = get_account_equity()
+        contract_size = get_contract_size(payload.symbol, payload.contract_size)
         sizing = compute_position(
             balance=balance,
             entry=payload.entry_price,
@@ -189,8 +215,9 @@ def place_entry_order(payload: "AlertPayload") -> dict:
             risk_pct=payload.risk_pct,
             max_cost=payload.max_cost,
             max_leverage=payload.max_leverage,
-            contract_size=payload.contract_size,
+            contract_size=contract_size,
         )
+        sizing["contract_size"] = contract_size
         sizing["mode"] = "auto"
         contracts = sizing["contracts"]
         leverage = sizing["leverage"]

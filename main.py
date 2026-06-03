@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 
@@ -23,11 +24,15 @@ app = FastAPI(title="TradingView MEXC Futures Webhook")
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 MEXC_WEB_KEY = os.environ["MEXC_WEB_KEY"]  # WEB key uit browser devtools
 
+# Munt waarin je futures-marge wordt aangehouden (voor saldo-opvraag)
+MARGIN_CURRENCY = os.environ.get("MARGIN_CURRENCY", "USDT")
+
 # Basis-URL van de MEXC futures web-API (zelfde paden als de officiele contract-API)
 BASE_URL = "https://futures.mexc.com/api/v1/private"
 ORDER_CREATE = BASE_URL + "/order/create"
 ORDER_CANCEL_ALL = BASE_URL + "/order/cancel_all"
 OPEN_POSITIONS = BASE_URL + "/position/open_positions"
+ACCOUNT_ASSET = BASE_URL + "/account/asset/"  # + currency
 TPSL_PLACE = BASE_URL + "/stoporder/place"
 TPSL_CANCEL_ALL = BASE_URL + "/stoporder/cancel_all"
 
@@ -52,10 +57,6 @@ ORDER_ACTIONS = OPEN_ACTIONS | CLOSE_ACTIONS
 
 ORDER_TYPE_LIMIT = "1"
 ORDER_TYPE_MARKET = "5"
-
-# MEXC position types in open_positions: 1 = long, 2 = short
-POSITION_TYPE_LONG = 1
-POSITION_TYPE_SHORT = 2
 
 
 def md5(value: str) -> str:
@@ -113,10 +114,88 @@ def mexc_get(url: str, params: Optional[dict] = None) -> dict:
     return result
 
 
+# --- SALDO & POSITIEGROOTTE ---
+
+def get_account_equity(currency: str = MARGIN_CURRENCY) -> float:
+    """Haal je beschikbare futures-saldo op (in USDT)."""
+    result = mexc_get(ACCOUNT_ASSET + currency.upper())
+    data = result.get("data") or {}
+    for field in ("equity", "availableBalance", "cashBalance"):
+        value = data.get(field)
+        if value is not None:
+            return float(value)
+    raise Exception(f"Kon saldo niet bepalen uit MEXC-respons: {data}")
+
+
+def compute_position(balance: float, entry: float, stop_loss: float,
+                     risk_pct: float, max_cost: float, max_leverage: int,
+                     contract_size: float) -> dict:
+    """Bereken contracten, leverage en kosten op basis van risico + max kosten.
+
+    - Positiegrootte volgt uit het risico: bij SL verlies je precies risk_pct van je saldo.
+    - Leverage is de kleinste hele hefboom zodat de marge (kosten) <= max_cost blijft,
+      afgetopt op max_leverage. Wordt de cap geraakt, dan kunnen de kosten hoger uitvallen
+      dan max_cost, maar het risico blijft op risk_pct."""
+    sl_dist = abs(entry - stop_loss)
+    if sl_dist <= 0:
+        raise Exception("Stop-loss afstand is 0; kan positiegrootte niet berekenen.")
+    if contract_size <= 0:
+        raise Exception("contract_size moet groter dan 0 zijn.")
+
+    risk_amount = balance * (risk_pct / 100.0)
+    coins_raw = risk_amount / sl_dist
+    contracts = max(1, int(round(coins_raw / contract_size)))
+
+    coins = contracts * contract_size
+    notional = coins * entry
+    leverage = max(1, min(int(max_leverage), math.ceil(notional / max_cost)))
+    cost = notional / leverage
+    actual_risk = coins * sl_dist
+
+    return {
+        "balance": round(balance, 4),
+        "risk_pct": risk_pct,
+        "risk_amount_target": round(risk_amount, 4),
+        "sl_distance": sl_dist,
+        "contracts": contracts,
+        "coins": coins,
+        "notional": round(notional, 4),
+        "leverage": leverage,
+        "cost": round(cost, 4),
+        "actual_risk": round(actual_risk, 4),
+        "cost_capped": cost > max_cost,
+    }
+
+
 # --- ORDER ACTIES ---
 
 def place_entry_order(payload: "AlertPayload") -> dict:
-    side = SIDE_MAP[payload.action.lower()]
+    action = payload.action.lower()
+    side = SIDE_MAP[action]
+
+    # Hoeveelheid + leverage: handmatig meegegeven, anders automatisch op live saldo
+    if payload.quantity is not None:
+        contracts = float(payload.quantity)
+        leverage = payload.leverage if payload.leverage is not None else 10
+        sizing = {"mode": "manual", "contracts": contracts, "leverage": leverage}
+    else:
+        if payload.entry_price is None or payload.stop_loss_price is None:
+            raise Exception("entry_price en stop_loss_price zijn nodig voor automatische sizing.")
+        balance = get_account_equity()
+        sizing = compute_position(
+            balance=balance,
+            entry=payload.entry_price,
+            stop_loss=payload.stop_loss_price,
+            risk_pct=payload.risk_pct,
+            max_cost=payload.max_cost,
+            max_leverage=payload.max_leverage,
+            contract_size=payload.contract_size,
+        )
+        sizing["mode"] = "auto"
+        contracts = sizing["contracts"]
+        leverage = sizing["leverage"]
+        logger.info("Auto-sizing: %s", sizing)
+
     order_type = ORDER_TYPE_LIMIT if payload.entry_price is not None else ORDER_TYPE_MARKET
     price = payload.entry_price if payload.entry_price is not None else 0
 
@@ -125,8 +204,8 @@ def place_entry_order(payload: "AlertPayload") -> dict:
         "side": side,
         "openType": payload.open_type,
         "type": order_type,
-        "vol": float(payload.quantity),
-        "leverage": payload.leverage,
+        "vol": float(contracts),
+        "leverage": int(leverage),
         "price": price,
         "priceProtect": "0",
     }
@@ -138,7 +217,8 @@ def place_entry_order(payload: "AlertPayload") -> dict:
         body["takeProfitTrend"] = 1
 
     logger.info("Entry order body: %s", body)
-    return mexc_post(ORDER_CREATE, body)
+    response = mexc_post(ORDER_CREATE, body)
+    return {"order": response, "sizing": sizing}
 
 
 def cancel_all(symbol: str) -> dict:
@@ -170,7 +250,6 @@ def move_sl_to_breakeven(symbol: str, stop_loss_price: float,
 
     position_id = pos.get("positionId")
     hold_vol = float(pos.get("holdVol", 0))
-    position_type = int(pos.get("positionType", 0))
 
     # Bestaande TP/SL plan-orders weghalen voordat we nieuwe plaatsen
     try:
@@ -201,12 +280,18 @@ class AlertPayload(BaseModel):
     secret: str
     action: str
     symbol: str
-    quantity: Optional[float] = None
+    entry_price: Optional[float] = None
     stop_loss_price: Optional[float] = None
     take_profit_price: Optional[float] = None
-    entry_price: Optional[float] = None
     open_type: int = 1
-    leverage: int = 10
+    # Automatische sizing (gebruikt als 'quantity' niet is meegegeven)
+    risk_pct: float = 1.0
+    max_cost: float = 400.0
+    max_leverage: int = 20
+    contract_size: float = 0.0001
+    # Handmatige override (optioneel)
+    quantity: Optional[float] = None
+    leverage: Optional[int] = None
 
 
 @app.post("/webhook")
@@ -218,14 +303,12 @@ async def receive_alert(payload: AlertPayload):
 
     # 1) Entry / exit orders
     if action in ORDER_ACTIONS:
-        if payload.quantity is None:
-            raise HTTPException(status_code=400, detail="quantity is verplicht bij " + action)
         if action in OPEN_ACTIONS and payload.stop_loss_price is None:
             raise HTTPException(status_code=400, detail="stop_loss_price is verplicht bij " + action)
         try:
             response = place_entry_order(payload)
             logger.info("Order geplaatst: %s", response)
-            return {"status": "ok", "action": action, "order": response}
+            return {"status": "ok", "action": action, **response}
         except Exception as e:
             logger.error("Order mislukt: %s", e)
             raise HTTPException(status_code=500, detail=str(e))

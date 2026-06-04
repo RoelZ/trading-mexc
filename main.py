@@ -33,8 +33,9 @@ ORDER_CREATE = BASE_URL + "/order/create"
 ORDER_CANCEL_ALL = BASE_URL + "/order/cancel_all"
 OPEN_POSITIONS = BASE_URL + "/position/open_positions"
 ACCOUNT_ASSET = BASE_URL + "/account/asset/"  # + currency
-TPSL_PLACE = BASE_URL + "/stoporder/place"
-TPSL_CANCEL_ALL = BASE_URL + "/stoporder/cancel_all"
+TPSL_OPEN_ORDERS = BASE_URL + "/stoporder/open_orders"        # actieve TP/SL orders ophalen
+TPSL_CHANGE_PRICE = BASE_URL + "/stoporder/change_price"      # TP/SL van een limit-order wijzigen
+TPSL_CHANGE_PLAN_PRICE = BASE_URL + "/stoporder/change_plan_price"  # TP/SL van een positie-order wijzigen
 
 # Publieke endpoint (geen signing) om de contractgrootte op te halen
 CONTRACT_DETAIL = "https://contract.mexc.com/api/v1/contract/detail"
@@ -255,50 +256,65 @@ def cancel_all(symbol: str) -> dict:
     return mexc_post(ORDER_CANCEL_ALL, body)
 
 
-def get_open_position(symbol: str) -> Optional[dict]:
-    """Haal de open positie voor een symbool op (positionId, holdVol, positionType)."""
-    result = mexc_get(OPEN_POSITIONS, {"symbol": symbol.upper()})
+def get_active_tpsl(symbol: str) -> list:
+    """Haal de actieve (nog niet getriggerde) TP/SL-orders voor een symbool op."""
+    result = mexc_get(TPSL_OPEN_ORDERS, {"symbol": symbol.upper()})
     data = result.get("data") or []
-    for pos in data:
-        if str(pos.get("symbol", "")).upper() == symbol.upper() and float(pos.get("holdVol", 0)) > 0:
-            return pos
-    return None
+    active = []
+    for o in data:
+        if str(o.get("symbol", "")).upper() != symbol.upper():
+            continue
+        # state 1 = nog niet getriggerd; isFinished 0 = niet in eindstatus
+        if int(o.get("state", 0)) == 1 and int(o.get("isFinished", 0)) == 0:
+            active.append(o)
+    return active
 
 
 def move_sl_to_breakeven(symbol: str, stop_loss_price: float,
                          take_profit_price: Optional[float]) -> dict:
-    """Verplaats de stop-loss naar break-even.
+    """Verplaats de stop-loss naar break-even DOOR de bestaande TP/SL-order te wijzigen.
 
-    Stappen: open positie opzoeken -> bestaande TP/SL annuleren ->
-    nieuwe TP/SL op de positie plaatsen met SL op de break-even prijs."""
-    pos = get_open_position(symbol)
-    if pos is None:
-        raise Exception(f"Geen open positie gevonden voor {symbol}; break-even overgeslagen.")
+    We annuleren niets en plaatsen niets nieuws: we passen alleen de SL-prijs aan op de
+    order die al op MEXC staat, en houden de bestaande take-profit intact. Zo is er geen
+    moment zonder bescherming."""
+    orders = get_active_tpsl(symbol)
+    if not orders:
+        raise Exception(
+            f"Geen actieve TP/SL-order gevonden voor {symbol}; break-even overgeslagen "
+            f"(positie mogelijk al gesloten of nog geen SL/TP aanwezig)."
+        )
 
-    position_id = pos.get("positionId")
-    hold_vol = float(pos.get("holdVol", 0))
+    order = orders[0]
+    limit_order_id = order.get("orderId")
+    plan_order_id = order.get("id")
 
-    # Bestaande TP/SL plan-orders weghalen voordat we nieuwe plaatsen
-    try:
-        mexc_post(TPSL_CANCEL_ALL, {"symbol": symbol.upper()})
-    except Exception as e:
-        logger.warning("Kon bestaande TP/SL niet annuleren (ga toch door): %s", e)
+    # Take-profit behouden: gebruik de meegestuurde TP, anders de bestaande van de order
+    tp = take_profit_price if take_profit_price is not None else order.get("takeProfitPrice")
 
-    body = {
-        "symbol": symbol.upper(),
-        "positionId": position_id,
-        "vol": hold_vol,
-        "stopLossPrice": stop_loss_price,
-        "lossTrend": 1,      # 1 = latest price
-        "profitTrend": 1,
-        "priceProtect": "0",
-    }
-    if take_profit_price is not None:
-        body["takeProfitPrice"] = take_profit_price
-
-    logger.info("Break-even TP/SL body (positie %s, %s contracten): %s",
-                position_id, hold_vol, body)
-    return mexc_post(TPSL_PLACE, body)
+    # MEXC: bij change_price worden TP én SL gewist als beide leeg/0 zijn -> dus altijd
+    # zowel de nieuwe SL als de (bestaande) TP meesturen.
+    if limit_order_id and int(limit_order_id) != 0:
+        body = {
+            "orderId": int(limit_order_id),
+            "stopLossPrice": stop_loss_price,
+            "lossTrend": 1,
+            "profitTrend": 1,
+        }
+        if tp is not None:
+            body["takeProfitPrice"] = tp
+        logger.info("Break-even via change_price (limit-order %s): %s", limit_order_id, body)
+        return mexc_post(TPSL_CHANGE_PRICE, body)
+    else:
+        body = {
+            "stopPlanOrderId": int(plan_order_id),
+            "stopLossPrice": stop_loss_price,
+            "lossTrend": 1,
+            "profitTrend": 1,
+        }
+        if tp is not None:
+            body["takeProfitPrice"] = tp
+        logger.info("Break-even via change_plan_price (positie-order %s): %s", plan_order_id, body)
+        return mexc_post(TPSL_CHANGE_PLAN_PRICE, body)
 
 
 # --- PAYLOAD MODEL ---

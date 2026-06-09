@@ -291,30 +291,42 @@ def move_sl_to_breakeven(symbol: str, stop_loss_price: float,
     # Take-profit behouden: gebruik de meegestuurde TP, anders de bestaande van de order
     tp = take_profit_price if take_profit_price is not None else order.get("takeProfitPrice")
 
-    # MEXC: bij change_price worden TP én SL gewist als beide leeg/0 zijn -> dus altijd
-    # zowel de nieuwe SL als de (bestaande) TP meesturen.
+    # MEXC: stuur altijd zowel de nieuwe SL als de (bestaande) TP mee, anders kan de
+    # TP/SL gewist worden.
+    def _sl_body(extra: dict) -> dict:
+        b = dict(extra)
+        b["stopLossPrice"] = stop_loss_price
+        b["lossTrend"] = 1
+        b["profitTrend"] = 1
+        if tp is not None:
+            b["takeProfitPrice"] = tp
+        return b
+
+    # Na een fill hoort de TP/SL bij de POSITIE -> wijzigen via change_plan_price
+    # (stopPlanOrderId). Zolang de limit-order nog niet gevuld is, hangt de TP/SL aan de
+    # ORDER -> change_price (orderId). Het orderId-veld blijft ook na de fill gevuld, dus
+    # we kunnen niet op dat veld vertrouwen: we proberen de positie-variant eerst en vallen
+    # terug op de order-variant.
+    attempts = []
+    if plan_order_id:
+        attempts.append(("change_plan_price", TPSL_CHANGE_PLAN_PRICE,
+                         _sl_body({"stopPlanOrderId": int(plan_order_id)})))
     if limit_order_id and int(limit_order_id) != 0:
-        body = {
-            "orderId": int(limit_order_id),
-            "stopLossPrice": stop_loss_price,
-            "lossTrend": 1,
-            "profitTrend": 1,
-        }
-        if tp is not None:
-            body["takeProfitPrice"] = tp
-        logger.info("Break-even via change_price (limit-order %s): %s", limit_order_id, body)
-        return mexc_post(TPSL_CHANGE_PRICE, body)
-    else:
-        body = {
-            "stopPlanOrderId": int(plan_order_id),
-            "stopLossPrice": stop_loss_price,
-            "lossTrend": 1,
-            "profitTrend": 1,
-        }
-        if tp is not None:
-            body["takeProfitPrice"] = tp
-        logger.info("Break-even via change_plan_price (positie-order %s): %s", plan_order_id, body)
-        return mexc_post(TPSL_CHANGE_PLAN_PRICE, body)
+        attempts.append(("change_price", TPSL_CHANGE_PRICE,
+                         _sl_body({"orderId": int(limit_order_id)})))
+
+    if not attempts:
+        raise Exception(f"Geen bruikbare order-id gevonden om de SL te wijzigen voor {symbol}.")
+
+    errors = []
+    for name, url, body in attempts:
+        try:
+            logger.info("Break-even via %s: %s", name, body)
+            return mexc_post(url, body)
+        except Exception as e:
+            logger.warning("Break-even via %s mislukt, probeer volgende: %s", name, e)
+            errors.append(f"{name}: {e}")
+    raise Exception("Break-even via alle endpoints mislukt -> " + " | ".join(errors))
 
 
 # --- PAYLOAD MODEL ---

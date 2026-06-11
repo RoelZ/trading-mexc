@@ -153,6 +153,39 @@ def get_account_equity(currency: str = MARGIN_CURRENCY) -> float:
     raise Exception(f"Kon saldo niet bepalen uit MEXC-respons: {data}")
 
 
+def check_web_key() -> dict:
+    """Controleer of de MEXC web-key nog geldig is via een lichte authenticated call.
+
+    Onderscheid drie uitkomsten:
+      valid = True   -> key werkt
+      valid = False  -> MEXC antwoordde, maar wees de aanvraag af (key verlopen/ongeldig)
+      valid = None   -> MEXC niet bereikbaar (netwerk/timeout), status onbekend"""
+    url = ACCOUNT_ASSET + MARGIN_CURRENCY.upper()
+    try:
+        signature = _sign("")
+        headers = _headers(signature)
+        if CURL_CFFI_AVAILABLE:
+            resp = cffi_requests.get(url, headers=headers, impersonate="chrome110")
+        else:
+            resp = cffi_requests.get(url, headers=headers)
+    except Exception as e:
+        return {"valid": None, "status": "unreachable", "reason": str(e)}
+
+    try:
+        result = resp.json()
+    except Exception:
+        return {"valid": None, "status": "bad_response", "reason": f"HTTP {getattr(resp, 'status_code', '?')}"}
+
+    if result.get("success"):
+        return {"valid": True, "status": "ok"}
+    return {
+        "valid": False,
+        "status": "invalid",
+        "code": result.get("code"),
+        "reason": result.get("message") or result.get("msg") or str(result),
+    }
+
+
 def compute_position(balance: float, entry: float, stop_loss: float,
                      risk_pct: float, max_cost: float, max_leverage: int,
                      contract_size: float) -> dict:
@@ -399,3 +432,16 @@ async def receive_alert(payload: AlertPayload):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/keycheck")
+def keycheck(secret: str = ""):
+    """Controleer of de MEXC web-key nog geldig is. Beveiligd met de webhook-secret.
+
+    Antwoord (altijd HTTP 200) bevat 'valid': true (ok), false (key ongeldig/verlopen)
+    of null (MEXC onbereikbaar). Bedoeld om periodiek door n8n te laten pollen."""
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    result = check_web_key()
+    logger.info("Keycheck: %s", result)
+    return result

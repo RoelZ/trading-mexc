@@ -5,7 +5,7 @@ import math
 import os
 import time
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
@@ -435,12 +435,16 @@ def health():
 
 
 @app.get("/keycheck")
-def keycheck(secret: str = ""):
+def keycheck(secret: str = "", x_webhook_secret: str = Header(default="")):
     """Controleer of de MEXC web-key nog geldig is. Beveiligd met de webhook-secret.
+
+    De secret mag je meegeven via de header 'x-webhook-secret' (aanbevolen) of via de
+    query-parameter 'secret'. De waarde moet gelijk zijn aan de WEBHOOK_SECRET env-var.
 
     Antwoord (altijd HTTP 200) bevat 'valid': true (ok), false (key ongeldig/verlopen)
     of null (MEXC onbereikbaar). Bedoeld om periodiek door n8n te laten pollen."""
-    if secret != WEBHOOK_SECRET:
+    provided = x_webhook_secret or secret
+    if provided != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
     result = check_web_key()
     logger.info("Keycheck: %s", result)

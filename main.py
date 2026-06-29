@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -124,11 +125,15 @@ def mexc_get(url: str, params: Optional[dict] = None) -> dict:
 
 # --- SALDO & POSITIEGROOTTE ---
 
-def get_contract_size(symbol: str, fallback: float) -> float:
-    """Haal de contractgrootte (coins per contract) op via de publieke MEXC-API.
+def get_contract_specs(symbol: str, fallback_contract_size: float = 0.0001) -> dict:
+    """Haal contractgrootte EN prijs-precisie op via de publieke MEXC-API.
 
-    Dit voorkomt verkeerde positiegroottes door een handmatig foute waarde.
-    Lukt de opvraag niet, dan wordt de meegestuurde waarde als fallback gebruikt."""
+    Geeft een dict terug met:
+      contract_size : coins per contract
+      price_scale   : aantal toegestane decimalen voor de prijs
+      price_unit    : prijs-tick (kleinste prijsstap)
+    Lukt de opvraag niet, dan worden veilige fallbacks gebruikt."""
+    specs = {"contract_size": fallback_contract_size, "price_scale": None, "price_unit": None}
     try:
         url = CONTRACT_DETAIL + "?symbol=" + symbol.upper()
         if CURL_CFFI_AVAILABLE:
@@ -137,13 +142,33 @@ def get_contract_size(symbol: str, fallback: float) -> float:
             response = cffi_requests.get(url)
         result = response.json()
         if result.get("success") and result.get("data"):
-            cs = result["data"].get("contractSize")
-            if cs:
-                return float(cs)
+            d = result["data"]
+            if d.get("contractSize"):
+                specs["contract_size"] = float(d["contractSize"])
+            if d.get("priceScale") is not None:
+                specs["price_scale"] = int(d["priceScale"])
+            if d.get("priceUnit"):
+                specs["price_unit"] = float(d["priceUnit"])
     except Exception as e:
-        logger.warning("Kon contractSize niet ophalen voor %s (gebruik fallback %s): %s",
-                       symbol, fallback, e)
-    return fallback
+        logger.warning("Kon contract-specs niet ophalen voor %s (fallback gebruikt): %s", symbol, e)
+    return specs
+
+
+def round_to_tick(price, specs: dict):
+    """Rond een prijs af op de toegestane tick/precisie van het contract.
+
+    MEXC's wijzig-endpoints (o.a. change_plan_price) weigeren prijzen met te veel
+    decimalen met code 2015. Hiermee voorkomen we die fout."""
+    if price is None:
+        return None
+    price = float(price)
+    price_unit = specs.get("price_unit")
+    price_scale = specs.get("price_scale")
+    if price_unit:
+        price = round(price / price_unit) * price_unit
+    if price_scale is not None:
+        price = round(price, price_scale)
+    return price
 
 
 def get_account_equity(currency: str = MARGIN_CURRENCY) -> float:
@@ -236,6 +261,9 @@ def place_entry_order(payload: "AlertPayload") -> dict:
     action = payload.action.lower()
     side = SIDE_MAP[action]
 
+    # Contract-specs (contractgrootte + prijs-tick) ophalen voor sizing en afronden
+    specs = get_contract_specs(payload.symbol, payload.contract_size)
+
     # Hoeveelheid + leverage: handmatig meegegeven, anders automatisch op live saldo
     if payload.quantity is not None:
         contracts = float(payload.quantity)
@@ -245,7 +273,6 @@ def place_entry_order(payload: "AlertPayload") -> dict:
         if payload.entry_price is None or payload.stop_loss_price is None:
             raise Exception("entry_price en stop_loss_price zijn nodig voor automatische sizing.")
         balance = get_account_equity()
-        contract_size = get_contract_size(payload.symbol, payload.contract_size)
         sizing = compute_position(
             balance=balance,
             entry=payload.entry_price,
@@ -253,16 +280,21 @@ def place_entry_order(payload: "AlertPayload") -> dict:
             risk_pct=payload.risk_pct,
             max_cost=payload.max_cost,
             max_leverage=payload.max_leverage,
-            contract_size=contract_size,
+            contract_size=specs["contract_size"],
         )
-        sizing["contract_size"] = contract_size
+        sizing["contract_size"] = specs["contract_size"]
         sizing["mode"] = "auto"
         contracts = sizing["contracts"]
         leverage = sizing["leverage"]
         logger.info("Auto-sizing: %s", sizing)
 
-    order_type = ORDER_TYPE_LIMIT if payload.entry_price is not None else ORDER_TYPE_MARKET
-    price = payload.entry_price if payload.entry_price is not None else 0
+    # Prijzen afronden op de tick-grootte van het contract (voorkomt precisie-fouten)
+    entry_price = round_to_tick(payload.entry_price, specs)
+    sl_price = round_to_tick(payload.stop_loss_price, specs)
+    tp_price = round_to_tick(payload.take_profit_price, specs)
+
+    order_type = ORDER_TYPE_LIMIT if entry_price is not None else ORDER_TYPE_MARKET
+    price = entry_price if entry_price is not None else 0
 
     body = {
         "symbol": payload.symbol.upper(),
@@ -274,11 +306,11 @@ def place_entry_order(payload: "AlertPayload") -> dict:
         "price": price,
         "priceProtect": "0",
     }
-    if payload.stop_loss_price is not None:
-        body["stopLossPrice"] = payload.stop_loss_price
+    if sl_price is not None:
+        body["stopLossPrice"] = sl_price
         body["stopLossTrend"] = 1  # 1 = latest price
-    if payload.take_profit_price is not None:
-        body["takeProfitPrice"] = payload.take_profit_price
+    if tp_price is not None:
+        body["takeProfitPrice"] = tp_price
         body["takeProfitTrend"] = 1
 
     logger.info("Entry order body: %s", body)
@@ -328,11 +360,17 @@ def move_sl_to_breakeven(symbol: str, stop_loss_price: float,
     # Take-profit behouden: gebruik de meegestuurde TP, anders de bestaande van de order
     tp = take_profit_price if take_profit_price is not None else order.get("takeProfitPrice")
 
+    # Prijzen afronden op de tick-grootte van het contract; MEXC weigert anders met
+    # code 2015 (precisie-fout).
+    specs = get_contract_specs(symbol)
+    sl_price = round_to_tick(stop_loss_price, specs)
+    tp = round_to_tick(tp, specs)
+
     # MEXC: stuur altijd zowel de nieuwe SL als de (bestaande) TP mee, anders kan de
     # TP/SL gewist worden.
     def _sl_body(extra: dict) -> dict:
         b = dict(extra)
-        b["stopLossPrice"] = stop_loss_price
+        b["stopLossPrice"] = sl_price
         b["lossTrend"] = 1
         b["profitTrend"] = 1
         if tp is not None:
@@ -573,10 +611,27 @@ def okx_get_equity(ccy: str = OKX_MARGIN_CURRENCY) -> float:
     raise Exception(f"Kon {ccy}-saldo niet bepalen uit OKX-respons: {data}")
 
 
-def okx_set_leverage(inst_id: str, lever: int, mgn_mode: str) -> dict:
+def okx_set_leverage(inst_id: str, lever: int, mgn_mode: str, pos_side: str = "net") -> dict:
+    """Zet leverage voor een instrument.
+
+    pos_side is verplicht in hedge-mode (long/short positiemodus):
+      "long"  -> voor een long positie
+      "short" -> voor een short positie
+      "net"   -> voor net/one-way mode (geen posSide vereist)
+
+    In net-mode sturen we posSide NIET mee (anders error 51000).
+    In hedge-mode sturen we "long" of "short" mee."""
     body = {"instId": inst_id, "lever": str(int(lever)), "mgnMode": mgn_mode}
+    if pos_side in ("long", "short"):
+        body["posSide"] = pos_side
     logger.info("OKX set-leverage: %s", body)
-    return okx_request("POST", "/api/v5/account/set-leverage", body=body)
+    try:
+        return okx_request("POST", "/api/v5/account/set-leverage", body=body)
+    except Exception as e:
+        # Als net-mode faalt met posSide-error, probeer opnieuw met posSide
+        if "51000" in str(e) and pos_side == "net":
+            logger.warning("set-leverage net-mode faalde (account in hedge-mode?), retry met posSide=long/short niet mogelijk hier — geef pos_side door via caller")
+        raise
 
 
 # --- ORDER ACTIES (OKX) ---
@@ -599,12 +654,16 @@ def okx_place_entry(payload: "OkxAlertPayload") -> dict:
         if payload.entry_price is None or payload.stop_loss_price is None:
             raise Exception("entry_price en stop_loss_price zijn nodig voor automatische sizing.")
         balance = okx_get_equity()
+        if payload.max_cost_pct is not None:
+            max_cost = balance * payload.max_cost_pct / 100.0
+        else:
+            max_cost = payload.max_cost
         sizing = compute_position(
             balance=balance,
             entry=payload.entry_price,
             stop_loss=payload.stop_loss_price,
             risk_pct=payload.risk_pct,
-            max_cost=payload.max_cost,
+            max_cost=max_cost,
             max_leverage=min(payload.max_leverage, inst_max_lever),
             contract_size=ct_val,
         )
@@ -614,7 +673,18 @@ def okx_place_entry(payload: "OkxAlertPayload") -> dict:
         leverage = sizing["leverage"]
         logger.info("OKX auto-sizing: %s", sizing)
 
-    okx_set_leverage(inst_id, leverage, td_mode)
+    # posSide voor set-leverage: "long"/"short" in hedge-mode, "net" in one-way mode.
+    # We proberen eerst net (one-way). Als OKX 51000 teruggeeft is de account in
+    # hedge-mode en sturen we de richting mee.
+    pos_side_for_lev = "long" if action == "open_long" else "short"
+    try:
+        okx_set_leverage(inst_id, leverage, td_mode, pos_side="net")
+    except Exception as e:
+        if "51000" in str(e):
+            logger.info("set-leverage net mislukt (hedge-mode account), retry met posSide=%s", pos_side_for_lev)
+            okx_set_leverage(inst_id, leverage, td_mode, pos_side=pos_side_for_lev)
+        else:
+            raise
 
     body = {
         "instId": inst_id,
@@ -735,14 +805,33 @@ def okx_move_sl_to_breakeven(symbol: str, stop_loss_price: float,
 
 
 def okx_check_key() -> dict:
-    """Controleer of de OKX API key werkt (zelfde semantiek als MEXC /keycheck)."""
+    """Controleer of de OKX API key werkt (zelfde semantiek als MEXC /keycheck).
+
+    Gebruikt /api/v5/account/balance als lightweight auth-check. Als de response
+    code=0 is maar details leeg (nieuw account / geen saldo), geldt de key toch
+    als geldig — want OKX heeft de request geauthenticeerd."""
     try:
         _okx_check_config()
     except Exception as e:
         return {"valid": False, "status": "not_configured", "reason": str(e)}
     try:
-        okx_get_equity()
-        return {"valid": True, "status": "ok"}
+        # Directe balance-call; negeer lege details — we willen alleen weten of
+        # de key geaccepteerd wordt, niet of er saldo staat.
+        result = okx_request("GET", "/api/v5/account/balance",
+                             params={"ccy": OKX_MARGIN_CURRENCY.upper()})
+        data = (result.get("data") or [{}])[0]
+        total_eq = data.get("totalEq", "")
+        details = data.get("details") or []
+        # Probeer saldo te lezen als bonus-info, maar laat key-status er niet van afhangen
+        balance_info = {}
+        for d in details:
+            if str(d.get("ccy", "")).upper() == OKX_MARGIN_CURRENCY.upper():
+                balance_info = {"ccy": OKX_MARGIN_CURRENCY,
+                                "availEq": d.get("availEq"), "eq": d.get("eq")}
+                break
+        return {"valid": True, "status": "ok",
+                "totalEq": total_eq or "0", "balance": balance_info or
+                f"geen {OKX_MARGIN_CURRENCY} in trading-account (stort USDC of zet account-mode op Futures)"}
     except Exception as e:
         message = str(e)
         if "OKX fout" in message or "OKX order-fout" in message:
@@ -764,7 +853,8 @@ class OkxAlertPayload(BaseModel):
     open_type: Optional[int] = None
     # Automatische sizing (gebruikt als 'quantity' niet is meegegeven)
     risk_pct: float = 1.0
-    max_cost: float = 400.0
+    max_cost_pct: Optional[float] = None   # % van saldo als max marge (bv. 20 = 20%); heeft voorrang op max_cost
+    max_cost: float = 400.0                # vaste max marge in USDC; wordt genegeerd als max_cost_pct is gezet
     max_leverage: int = 10  # X-perps op OKX EU retail: max 10x
     # Genegeerd (contractgrootte komt live van OKX); aanwezig voor Pine-compat
     contract_size: Optional[float] = None
@@ -817,7 +907,7 @@ async def receive_okx_alert(payload: OkxAlertPayload):
             logger.error("OKX annuleren mislukt: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
 
-    # 4) Stop-loss naar break-even
+    # 4) Stop-loss verplaatsen naar opgegeven prijs
     if action == "move_sl_be":
         if payload.stop_loss_price is None:
             raise HTTPException(status_code=400, detail="stop_loss_price is verplicht bij move_sl_be")
@@ -825,10 +915,10 @@ async def receive_okx_alert(payload: OkxAlertPayload):
             response = okx_move_sl_to_breakeven(
                 payload.symbol, payload.stop_loss_price, payload.take_profit_price
             )
-            logger.info("OKX break-even gezet: %s", response)
+            logger.info("OKX SL verplaatst: %s", response)
             return {"status": "ok", "action": action, "result": response}
         except Exception as e:
-            logger.error("OKX break-even mislukt: %s", e)
+            logger.error("OKX SL verplaatsen mislukt: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
 
     valid = sorted(ORDER_ACTIONS) + ["cancel", "move_sl_be"]
@@ -844,3 +934,335 @@ def okx_keycheck(secret: str = "", x_webhook_secret: str = Header(default="")):
     result = okx_check_key()
     logger.info("OKX keycheck: %s", result)
     return result
+
+
+# ============================================================================
+# --- IBKR (Interactive Brokers via IB Gateway) ---
+#
+# Verbindt via ib_insync met een lokaal draaiende IB Gateway container.
+# Poort 4002 = paper trading, 4001 = live trading.
+#
+# IB_GATEWAY_HOST: hostname van de IB Gateway container.
+#   - Als beide containers in hetzelfde Coolify Docker-netwerk zitten:
+#     gebruik de Coolify service-naam (bijv. "ib-gateway").
+#   - Als IB Gateway via port-mapping op de host staat (4002:4002):
+#     gebruik "172.17.0.1" (Docker host IP op Linux) of het server-IP.
+#
+# Ondersteunde secType waarden:
+#   STK  = aandelen (NVDA, MSTR, enz.) via exchange SMART
+#   FUT  = futures (NQ, ES, enz.) — geef ook expiry mee in het payload
+#   CASH = forex (EUR/USD enz.)
+# ============================================================================
+
+try:
+    from ib_insync import IB, Contract, Stock, Future, Forex
+    from ib_insync import MarketOrder, LimitOrder, StopOrder, BracketOrder
+    IB_INSYNC_AVAILABLE = True
+except ImportError:
+    IB_INSYNC_AVAILABLE = False
+    logger.warning("ib_insync niet geïnstalleerd — /ibkr endpoints niet beschikbaar.")
+
+IB_GATEWAY_HOST = os.environ.get("IB_GATEWAY_HOST", "172.17.0.1")
+IB_GATEWAY_PORT = int(os.environ.get("IB_GATEWAY_PORT", "4002"))  # 4002=paper, 4001=live
+IB_CLIENT_ID = int(os.environ.get("IB_CLIENT_ID", "10"))
+
+_ib: "IB | None" = None
+
+
+async def _get_ib() -> "IB":
+    """Geeft een actieve IB-verbinding terug; verbindt opnieuw als de connectie weg is."""
+    global _ib
+    if not IB_INSYNC_AVAILABLE:
+        raise Exception("ib_insync is niet geïnstalleerd.")
+    if _ib is None:
+        _ib = IB()
+    if not _ib.isConnected():
+        await _ib.connectAsync(IB_GATEWAY_HOST, IB_GATEWAY_PORT, clientId=IB_CLIENT_ID)
+        logger.info("Verbonden met IB Gateway op %s:%s", IB_GATEWAY_HOST, IB_GATEWAY_PORT)
+    return _ib
+
+
+def _ibkr_make_contract(symbol: str, sec_type: str, exchange: str,
+                         currency: str, expiry: str) -> "Contract":
+    """Maak het juiste ib_insync Contract-object op basis van sec_type."""
+    sec_type = sec_type.upper()
+    if sec_type == "STK":
+        return Stock(symbol.upper(), exchange or "SMART", currency or "USD")
+    if sec_type == "FUT":
+        if not expiry:
+            raise Exception("expiry (bijv. '202509') is verplicht voor futures (FUT).")
+        return Future(symbol.upper(), expiry, exchange or "CME", currency=currency or "USD")
+    if sec_type == "CASH":
+        # symbol als "EURUSD"; ib_insync verwacht symbol="EUR", currency="USD"
+        sym, ccy = (symbol[:3], symbol[3:]) if len(symbol) == 6 else (symbol, currency)
+        return Forex(sym.upper(), currency=ccy.upper() or "USD")
+    raise Exception(f"Onbekend sec_type '{sec_type}'. Gebruik STK, FUT of CASH.")
+
+
+async def ibkr_place_entry(payload: "IbkrAlertPayload") -> dict:
+    """Plaatst een entry order (market of limit) met optionele SL via aparte stop-order."""
+    ib = await _get_ib()
+    action = payload.action.lower()
+
+    # BUY voor long, SELL voor short
+    ib_side = "BUY" if action == "open_long" else "SELL"
+
+    contract = _ibkr_make_contract(
+        payload.symbol, payload.sec_type, payload.exchange,
+        payload.currency, payload.expiry
+    )
+
+    # Contract kwalificeren (IBKR vult ontbrekende velden aan)
+    qualified = await ib.qualifyContractsAsync(contract)
+    if not qualified:
+        raise Exception(f"Kon contract niet kwalificeren: {payload.symbol} ({payload.sec_type})")
+    contract = qualified[0]
+
+    quantity = float(payload.quantity) if payload.quantity is not None else 1.0
+
+    # Bracket order (entry + SL + optioneel TP) of losse entry
+    if payload.stop_loss_price is not None:
+        sl_action = "SELL" if ib_side == "BUY" else "BUY"
+
+        if payload.entry_price is not None:
+            parent = LimitOrder(ib_side, quantity, payload.entry_price,
+                                outsideRth=payload.outside_rth, tif="GTC")
+        else:
+            parent = MarketOrder(ib_side, quantity,
+                                 outsideRth=payload.outside_rth, tif="GTC")
+
+        sl_order = StopOrder(sl_action, quantity, payload.stop_loss_price, tif="GTC")
+
+        # Koppel SL aan de parent via transmit-logica
+        parent.transmit = False
+        sl_order.parentId = 0  # wordt gezet na plaatsen parent
+
+        # Trade parent eerst plaatsen om orderId te krijgen
+        parent_trade = ib.placeOrder(contract, parent)
+        await asyncio.sleep(0.5)  # korte wacht voor orderId toewijzing
+        sl_order.parentId = parent_trade.order.orderId
+        sl_order.transmit = True
+
+        if payload.take_profit_price is not None:
+            tp_action = sl_action
+            tp_order = LimitOrder(tp_action, quantity, payload.take_profit_price, tif="GTC")
+            tp_order.parentId = parent_trade.order.orderId
+            tp_order.transmit = False
+            ib.placeOrder(contract, tp_order)
+
+        sl_trade = ib.placeOrder(contract, sl_order)
+        await asyncio.sleep(0.3)
+
+        return {
+            "entry_orderId": parent_trade.order.orderId,
+            "sl_orderId": sl_trade.order.orderId,
+            "contract": contract.localSymbol or contract.symbol,
+            "side": ib_side,
+            "quantity": quantity,
+        }
+
+    else:
+        # Losse entry zonder SL
+        if payload.entry_price is not None:
+            order = LimitOrder(ib_side, quantity, payload.entry_price,
+                               outsideRth=payload.outside_rth, tif="GTC")
+        else:
+            order = MarketOrder(ib_side, quantity,
+                                outsideRth=payload.outside_rth)
+
+        trade = ib.placeOrder(contract, order)
+        await asyncio.sleep(0.3)
+        return {
+            "orderId": trade.order.orderId,
+            "contract": contract.localSymbol or contract.symbol,
+            "side": ib_side,
+            "quantity": quantity,
+        }
+
+
+async def ibkr_close_position(payload: "IbkrAlertPayload") -> dict:
+    """Sluit de volledige bestaande positie via een market order."""
+    ib = await _get_ib()
+    action = payload.action.lower()
+    close_side = "SELL" if action == "close_long" else "BUY"
+
+    contract = _ibkr_make_contract(
+        payload.symbol, payload.sec_type, payload.exchange,
+        payload.currency, payload.expiry
+    )
+    qualified = await ib.qualifyContractsAsync(contract)
+    if not qualified:
+        raise Exception(f"Kon contract niet kwalificeren: {payload.symbol}")
+    contract = qualified[0]
+
+    # Zoek open positie voor de exacte hoeveelheid
+    await ib.reqPositionsAsync()
+    positions = [p for p in ib.positions()
+                 if p.contract.conId == contract.conId and p.position != 0]
+
+    if positions:
+        qty = abs(positions[0].position)
+    elif payload.quantity is not None:
+        qty = float(payload.quantity)
+    else:
+        raise Exception(f"Geen open positie gevonden voor {payload.symbol} en geen quantity opgegeven.")
+
+    order = MarketOrder(close_side, qty, outsideRth=payload.outside_rth)
+    trade = ib.placeOrder(contract, order)
+    await asyncio.sleep(0.3)
+    return {
+        "orderId": trade.order.orderId,
+        "contract": contract.localSymbol or contract.symbol,
+        "side": close_side,
+        "quantity": qty,
+    }
+
+
+async def ibkr_cancel_all(payload: "IbkrAlertPayload") -> dict:
+    """Annuleer alle openstaande orders voor dit contract."""
+    ib = await _get_ib()
+    contract = _ibkr_make_contract(
+        payload.symbol, payload.sec_type, payload.exchange,
+        payload.currency, payload.expiry
+    )
+    qualified = await ib.qualifyContractsAsync(contract)
+    con_id = qualified[0].conId if qualified else None
+
+    open_trades = ib.openTrades()
+    cancelled = 0
+    for trade in open_trades:
+        if con_id and trade.contract.conId != con_id:
+            continue
+        ib.cancelOrder(trade.order)
+        cancelled += 1
+
+    return {"cancelled": cancelled, "symbol": payload.symbol}
+
+
+async def ibkr_move_sl_to_breakeven(payload: "IbkrAlertPayload") -> dict:
+    """Verplaats de bestaande stop-order naar de opgegeven stop_loss_price."""
+    ib = await _get_ib()
+    contract = _ibkr_make_contract(
+        payload.symbol, payload.sec_type, payload.exchange,
+        payload.currency, payload.expiry
+    )
+    qualified = await ib.qualifyContractsAsync(contract)
+    con_id = qualified[0].conId if qualified else None
+
+    # Zoek openstaande stop-orders voor dit contract
+    open_trades = ib.openTrades()
+    stop_trades = [
+        t for t in open_trades
+        if t.order.orderType in ("STP", "STOP")
+        and (con_id is None or t.contract.conId == con_id)
+    ]
+
+    if not stop_trades:
+        raise Exception(f"Geen open stop-order gevonden voor {payload.symbol}.")
+
+    modified = []
+    for trade in stop_trades:
+        trade.order.auxPrice = payload.stop_loss_price
+        ib.placeOrder(trade.contract, trade.order)  # herplaatsen = wijzigen
+        modified.append(trade.order.orderId)
+
+    await asyncio.sleep(0.3)
+    return {"modified_orders": modified, "new_sl": payload.stop_loss_price}
+
+
+async def ibkr_check_connection() -> dict:
+    """Test de verbinding met IB Gateway."""
+    if not IB_INSYNC_AVAILABLE:
+        return {"valid": False, "status": "not_installed",
+                "reason": "ib_insync niet geïnstalleerd"}
+    try:
+        ib = await _get_ib()
+        accounts = ib.managedAccounts()
+        return {"valid": True, "status": "ok", "accounts": accounts}
+    except Exception as e:
+        return {"valid": False, "status": "unreachable", "reason": str(e)}
+
+
+# --- PAYLOAD MODEL & ENDPOINTS (IBKR) ---
+
+class IbkrAlertPayload(BaseModel):
+    secret: str
+    action: str                           # open_long | open_short | close_long | close_short | cancel | move_sl_be
+    symbol: str                           # bv. "NVDA", "NQ", "EURUSD"
+    sec_type: str = "STK"                 # STK | FUT | CASH
+    exchange: str = "SMART"              # SMART (aandelen) | CME (NQ/ES) | IDEALPRO (forex)
+    currency: str = "USD"
+    expiry: str = ""                      # verplicht voor FUT, bv. "202509"
+    entry_price: Optional[float] = None   # None = market order
+    stop_loss_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
+    quantity: Optional[float] = None      # aantal aandelen / contracts
+    outside_rth: bool = False             # True = orders buiten beurstijden toestaan
+
+
+@app.post("/ibkr/webhook")
+async def receive_ibkr_alert(payload: IbkrAlertPayload):
+    if payload.secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    action = payload.action.lower()
+
+    # 1) Entry orders
+    if action in OPEN_ACTIONS:
+        try:
+            response = await ibkr_place_entry(payload)
+            logger.info("IBKR order geplaatst: %s", response)
+            return {"status": "ok", "action": action, **response}
+        except Exception as e:
+            logger.error("IBKR order mislukt: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # 2) Positie sluiten
+    if action in CLOSE_ACTIONS:
+        try:
+            response = await ibkr_close_position(payload)
+            logger.info("IBKR positie gesloten: %s", response)
+            return {"status": "ok", "action": action, **response}
+        except Exception as e:
+            logger.error("IBKR sluiten mislukt: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # 3) Orders annuleren
+    if action == "cancel":
+        try:
+            response = await ibkr_cancel_all(payload)
+            logger.info("IBKR orders geannuleerd: %s", response)
+            return {"status": "ok", "action": action, **response}
+        except Exception as e:
+            logger.error("IBKR annuleren mislukt: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # 4) Stop-loss naar break-even
+    if action == "move_sl_be":
+        if payload.stop_loss_price is None:
+            raise HTTPException(status_code=400, detail="stop_loss_price is verplicht bij move_sl_be")
+        try:
+            response = await ibkr_move_sl_to_breakeven(payload)
+            logger.info("IBKR break-even gezet: %s", response)
+            return {"status": "ok", "action": action, **response}
+        except Exception as e:
+            logger.error("IBKR break-even mislukt: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    valid = sorted(ORDER_ACTIONS) + ["cancel", "move_sl_be"]
+    raise HTTPException(status_code=400, detail="Ongeldig action. Gebruik: " + str(valid))
+
+
+@app.get("/ibkr/keycheck")
+async def ibkr_keycheck(secret: str = "", x_webhook_secret: str = Header(default="")):
+    """Test verbinding met IB Gateway verbinding."""
+    provided = x_webhook_secret or secret
+    if provided != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    # Minimale check: kan de module geladen worden?
+    try:
+        import importlib
+        importlib.import_module("ib_insync")
+        return {"valid": True, "status": "module_ok"}
+    except ImportError:
+        return {"valid": False, "status": "ib_insync_not_installed"}

@@ -301,10 +301,17 @@ def okx_place_entry(payload: "OkxAlertPayload") -> dict:
     return {"order": response, "sizing": sizing, "instId": inst_id}
 
 
-def okx_close_position(symbol: str, td_mode: str) -> dict:
-    """Sluit de volledige positie tegen marktprijs (net mode)."""
+def okx_close_position(symbol: str, td_mode: str, action: str = "") -> dict:
+    """Sluit de volledige positie tegen marktprijs.
+
+    In hedge-mode is posSide verplicht; we leiden die af van de action
+    (close_long -> long, close_short -> short)."""
     inst_id = okx_get_instrument(symbol)["instId"]
-    body = {"instId": inst_id, "mgnMode": td_mode, "autoCxl": True}
+    body: dict = {"instId": inst_id, "mgnMode": td_mode, "autoCxl": True}
+    if action == "close_long":
+        body["posSide"] = "long"
+    elif action == "close_short":
+        body["posSide"] = "short"
     logger.info("OKX close-position: %s", body)
     return okx_request("POST", "/api/v5/trade/close-position", body=body)
 
@@ -346,18 +353,51 @@ def okx_move_sl_to_breakeven(symbol: str, stop_loss_price: float,
             errors.append(f"orders-algo-pending {ord_type}: {e}")
             continue
         for algo in algos:
+            algo_id = algo["algoId"]
+            tp = take_profit_price if take_profit_price is not None else algo.get("tpTriggerPx")
             try:
-                body = {"instId": inst_id, "algoId": algo["algoId"],
+                body = {"instId": inst_id, "algoId": algo_id,
                         "newSlTriggerPx": new_sl, "newSlOrdPx": "-1"}
-                tp = take_profit_price if take_profit_price is not None else algo.get("tpTriggerPx")
                 if tp not in (None, ""):
                     body["newTpTriggerPx"] = _okx_num(float(tp))
                     body["newTpOrdPx"] = "-1"
                 logger.info("Break-even via amend-algo-order: %s", body)
                 return okx_request("POST", "/api/v5/trade/amend-algo-order", body=body)
             except Exception as e:
-                logger.warning("Break-even via amend-algo-order mislukt: %s", e)
-                errors.append(f"amend-algo-order {algo.get('algoId')}: {e}")
+                err_str = str(e)
+                if "404" in err_str or "Not Found" in err_str:
+                    # amend-algo-order niet beschikbaar op EEA/X-perp -> cancel + herplaatsen
+                    logger.info("amend-algo-order 404, cancel+herplaats voor algoId=%s", algo_id)
+                    try:
+                        okx_request("POST", "/api/v5/trade/cancel-algo-orders",
+                                    body=[{"instId": inst_id, "algoId": algo_id}])
+                        new_ord: dict = {
+                            "instId": inst_id,
+                            "tdMode": algo.get("tdMode", "isolated"),
+                            "side": algo.get("side", "sell"),
+                            "sz": algo.get("sz", "1"),
+                            "slTriggerPx": new_sl,
+                            "slOrdPx": "-1",
+                            "slTriggerPxType": "last",
+                        }
+                        pos_side = algo.get("posSide")
+                        if pos_side and pos_side != "net":
+                            new_ord["posSide"] = pos_side
+                        if tp not in (None, ""):
+                            new_ord["tpTriggerPx"] = _okx_num(float(tp))
+                            new_ord["tpOrdPx"] = "-1"
+                            new_ord["tpTriggerPxType"] = "last"
+                            new_ord["ordType"] = "oco"
+                        else:
+                            new_ord["ordType"] = "conditional"
+                        logger.info("Break-even via cancel+herplaats: %s", new_ord)
+                        return okx_request("POST", "/api/v5/trade/order-algo", body=new_ord)
+                    except Exception as e2:
+                        logger.warning("cancel+herplaats mislukt voor algoId=%s: %s", algo_id, e2)
+                        errors.append(f"cancel+herplaats {algo_id}: {e2}")
+                else:
+                    logger.warning("Break-even via amend-algo-order mislukt: %s", e)
+                    errors.append(f"amend-algo-order {algo_id}: {e}")
 
     # 2) Order-variant: TP/SL hangt nog aan de ongevulde limit-order
     try:
@@ -475,7 +515,7 @@ async def receive_okx_alert(payload: OkxAlertPayload):
     # 2) Positie sluiten (market)
     if action in CLOSE_ACTIONS:
         try:
-            response = okx_close_position(payload.symbol, payload.effective_td_mode())
+            response = okx_close_position(payload.symbol, payload.effective_td_mode(), action)
             logger.info("OKX positie gesloten: %s", response)
             return {"status": "ok", "action": action, "result": response}
         except Exception as e:

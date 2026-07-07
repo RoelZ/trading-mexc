@@ -109,11 +109,6 @@ def okx_request(method: str, path: str, params: Optional[dict] = None,
 
 _instrument_cache: dict = {}
 
-# Actieve orders per symbol (opgeslagen bij plaatsen, opgeruimd bij sluiten/annuleren).
-# Sleutel: symbol.upper(), waarde: {"ordId": "...", "instId": "..."}
-# Doel: move_sl_be gebruikt altijd exact de eigen orderId, nooit een stale order.
-_active_orders: dict = {}
-
 
 def okx_get_instrument(symbol: str) -> dict:
     """Resolve een symbool naar het live X-perp instrument.
@@ -257,14 +252,6 @@ def okx_place_entry(payload: "OkxAlertPayload") -> dict:
 
     logger.info("OKX entry order body: %s", body)
     response = okx_request("POST", "/api/v5/trade/order", body=body)
-    ord_id = (response.get("data") or [{}])[0].get("ordId", "")
-    if ord_id:
-        _active_orders[payload.symbol.upper()] = {
-            "ordId": ord_id,
-            "instId": inst_id,
-            "placed_at": time.time(),
-        }
-        logger.info("OKX actief order opgeslagen: symbol=%s ordId=%s", payload.symbol.upper(), ord_id)
     return {"order": response, "sizing": sizing, "instId": inst_id}
 
 
@@ -369,28 +356,14 @@ def okx_move_sl_to_breakeven(symbol: str, stop_loss_price: float,
                     errors.append(f"amend-algo-order {algo_id}: {e}")
 
     # 2) Order-variant: TP/SL hangt nog aan de ongevulde limit-order
-    # Primair: gebruik de opgeslagen orderId (geplaatst in deze sessie) voor directe lookup.
-    # Fallback bij herstart server: query orders-pending — er is altijd max. 1 order per symbol.
-    pending_orders: list = []
-    stored = _active_orders.get(symbol.upper())
-    if stored:
-        try:
-            res = okx_request("GET", "/api/v5/trade/order",
-                              params={"instId": inst_id, "ordId": stored["ordId"]})
-            order_data = (res.get("data") or [{}])[0]
-            if order_data.get("attachAlgoOrds"):
-                pending_orders = [order_data]
-                logger.info("Break-even stap 2 via opgeslagen ordId=%s", stored["ordId"])
-        except Exception as e:
-            errors.append(f"get-order {stored['ordId']}: {e}")
-    if not pending_orders:
-        try:
-            result = okx_request("GET", "/api/v5/trade/orders-pending",
-                                 params={"instType": "FUTURES", "instId": inst_id})
-            pending_orders = result.get("data") or []
-        except Exception as e:
-            errors.append(f"orders-pending: {e}")
-    for order in pending_orders:
+    try:
+        result = okx_request("GET", "/api/v5/trade/orders-pending",
+                             params={"instType": "FUTURES", "instId": inst_id})
+        orders = result.get("data") or []
+    except Exception as e:
+        orders = []
+        errors.append(f"orders-pending: {e}")
+    for order in orders:
         attached = order.get("attachAlgoOrds") or []
         if not attached:
             continue
@@ -501,7 +474,6 @@ async def receive_okx_alert(payload: OkxAlertPayload):
 
     # 2) Positie sluiten (market)
     if action in CLOSE_ACTIONS:
-        _active_orders.pop(payload.symbol.upper(), None)
         try:
             response = okx_close_position(payload.symbol, payload.effective_td_mode(), action)
             logger.info("OKX positie gesloten: %s", response)
@@ -512,21 +484,6 @@ async def receive_okx_alert(payload: OkxAlertPayload):
 
     # 3) Ongevulde order annuleren (timeout)
     if action == "cancel":
-        # Race-condition guard: als een order minder dan 10 seconden geleden is
-        # geplaatst negeren we de cancel. Dit voorkomt dat een TradingView session-
-        # start cancel (bar N+1) een order weggooit dat net door open_long (bar N)
-        # is geplaatst — beide freq_once_per_bar_close alerts arriveren binnen ms.
-        stored = _active_orders.get(payload.symbol.upper())
-        if stored and (time.time() - stored.get("placed_at", 0)) < 10:
-            logger.warning(
-                "OKX cancel genegeerd: order %s slechts %.1fs geleden geplaatst "
-                "(race-condition guard — TradingView session-start vs. open_long).",
-                stored["ordId"],
-                time.time() - stored.get("placed_at", 0),
-            )
-            return {"status": "skipped", "reason": "recent_order_grace_period",
-                    "ordId": stored["ordId"]}
-        _active_orders.pop(payload.symbol.upper(), None)
         try:
             response = okx_cancel_all(payload.symbol)
             logger.info("OKX orders geannuleerd: %s", response)
